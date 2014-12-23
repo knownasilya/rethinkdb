@@ -17,11 +17,14 @@ module 'TableView', ->
             @distribution = null
             @table_view = null
 
+            @guaranteed_timer = null
+            @failable_timer = null
+
             @fetch_data()
 
         fetch_data: =>
             this_id = @id
-            query =
+            guaranteed_query =
                 r.do(
                     r.db(system_db).table('server_config').coerceTo('array'),
                     r.db(system_db).table('table_status').get(this_id),
@@ -44,62 +47,123 @@ module 'TableView', ->
                                     shard('replicas').filter({state: "ready"})).count()
                                 num_replicas_per_shard: table("shards").map((shard) -> shard('replicas').count()).max()
                                 status: table('status')
-                                shards_assignments: table_config("shards").map(r.range(), (shard, position) ->
-                                    id: position.add(1)
-                                    num_keys: 'N/A' # updated below if table is ready
-                                    primary:
-                                        id: server_config.filter({name: shard("primary_replica")}).nth(0)("id")
-                                        name: shard("primary_replica")
-                                    replicas: shard("replicas")
-                                        .filter( (replica) -> replica.ne(shard("primary_replica")))
-                                        .map (name) ->
-                                            id: server_config.filter({name: name}).nth(0)("id")
-                                            name: name
-                                ).coerceTo('array')
                                 id: table("id")
                                 # These are updated below if the table is ready
-                                indexes: null
-                                distribution: []
-                                total_keys: null
-                            ).do( (table) ->
-                                r.branch( # We must be sure that the table is ready before retrieving these keys
-                                    table('status')('ready_for_writes').not(),
-                                    table,
-                                    table.merge({
-                                        indexes: r.db(table("db"))
-                                            .table(table("name"), {useOutdated: true})
-                                            .indexStatus()
-                                            .pluck('index', 'ready', 'blocks_processed', 'blocks_total')
-                                            .merge( (index) -> {
-                                                id: index("index")
-                                                db: table("db")
-                                                table: table("name")
-                                            }) # add an id for backbone
-                                        distribution: r.db(table('db'))
-                                            .table(table('name'), {useOutdated: true})
-                                            .info()('doc_count_estimates')
-                                            .map(r.range(), (num_keys, position) ->
-                                                num_keys: num_keys
-                                                id: position)
-                                            .coerceTo('array')
-                                        total_keys: r.db(table('db'))
-                                            .table(table('name'), {useOutdated: true})
-                                            .info()('doc_count_estimates')
-                                            .sum()
-                                        shards_assignments: table('shards_assignments').map(r.range(), (shard_assignment, position) ->
-                                            shard_assignment.merge {
-                                                num_keys: r.db(table('db'))
-                                                    .table(table('name'), {useOutdated: true})
-                                                    .info()('doc_count_estimates')(position)
-                                            }
-                                        ).coerceTo('array')
-                                    })
-                                )
                             ).without('shards')
                         )
                     )
+            failable_query = r.do(
+                r.db(system_db).table('table_status').get(this_id),
+                r.db(system_db).table('table_config').get(this_id),
+                r.db(system_db).table('server_config').coerceTo('array'),
+                (table, table_config, server_config) ->
+                    table.merge({
+                        indexes: r.db(table("db"))
+                            .table(table("name"), {useOutdated: true})
+                            .indexStatus()
+                            .pluck('index', 'ready', 'blocks_processed', 'blocks_total')
+                            .merge( (index) -> {
+                                id: index("index")
+                                db: table("db")
+                                table: table("name")
+                            }) # add an id for backbone
+                        distribution: r.db(table('db'))
+                            .table(table('name'), {useOutdated: true})
+                            .info()('doc_count_estimates')
+                            .map(r.range(), (num_keys, position) ->
+                                num_keys: num_keys
+                                id: position)
+                            .coerceTo('array')
+                        total_keys: r.db(table('db'))
+                            .table(table('name'), {useOutdated: true})
+                            .info()('doc_count_estimates')
+                            .sum()
+                        shards_assignments: table_config("shards").map(r.range(),
+                            (shard, position) ->
+                                id: position.add(1)
+                                num_keys: r.db(table('db'))
+                                    .table(table('name'), {useOutdated: true})
+                                    .info()('doc_count_estimates')(position)
+                                primary:
+                                    id: server_config.filter({name: shard("primary_replica")}).nth(0)("id")
+                                    name: shard("primary_replica")
+                                replicas: shard("replicas")
+                                    .filter( (replica) -> replica.ne(shard("primary_replica")))
+                                    .map (name) ->
+                                        id: server_config.filter({name: name}).nth(0)("id")
+                                        name: name
+                        ).coerceTo('array')
+                    })
+            )
+            @failable_timer = driver.run failable_query, 1000, (error, result) =>
+                if error?
+                    console.log error.msg
+                    return
+                @error = null
+                if @indexes?
+                    @indexes.set _.map(result.indexes, (index) -> new Index index)
+                else
+                    @indexes = new Indexes _.map result.indexes, (index) ->
+                        new Index index
+                @table_view?.set_indexes @indexes
+                if @distribution?
+                    @distribution.set _.map result.distribution, (shard) ->
+                        new Shard shard
+                    @distribution.trigger 'update'
+                else
+                    @distribution = new Distribution _.map(
+                        result.distribution, (shard) -> new Shard shard)
+                    @table_view?.set_distribution @distribution
+                shards_assignments = []
+                for shard in result.shards_assignments
+                    shards_assignments.push
+                        id: "start_shard_#{shard.id}"
+                        shard_id: shard.id
+                        num_keys: shard.num_keys
+                        start_shard: true
 
-            @timer = driver.run query, 5000, (error, result) =>
+                    shards_assignments.push
+                        id: "shard_primary_#{shard.id}"
+                        primary: true
+                        shard_id: shard.id
+                        data: shard.primary
+
+                    for replica, position in shard.replicas
+                        shards_assignments.push
+                            id: "shard_replica_#{shard.id}_#{position}"
+                            replica: true
+                            replica_position: position
+                            shard_id: shard.id
+                            data: replica
+
+                    shards_assignments.push
+                        id: "end_shard_#{shard.id}"
+                        shard_id: shard.id
+                        end_shard: true
+
+                if @shards_assignments?
+                    @shards_assignments.set _.map shards_assignments, (shard) ->
+                        new ShardAssignment shard
+                else
+                    @shards_assignments = new ShardAssignments(
+                        _.map shards_assignments,
+                            (shard) -> new ShardAssignment shard
+                    )
+                    @table_view?.set_assignments @shards_assignments
+                if @model?
+                    @model.set result
+                else
+                    @model = new Table result
+                    @table_view = new TableView.TableMainView
+                        model: @model
+                        indexes: @indexes
+                        distribution: @distribution
+                        shards_assignments: @shards_assignments
+                    @render()
+
+
+
+            @guaranteed_timer = driver.run guaranteed_query, 5000, (error, result) =>
                 if error?
                     # TODO: We may want to render only if we failed to open a connection
                     # TODO: Handle when the table is deleted
@@ -119,68 +183,6 @@ module 'TableView', ->
                             @render()
                     else
                         @loading = false
-                        if result.indexes?
-                            if @indexes?
-                                @indexes.set _.map(result.indexes, (index) -> new Index index)
-                            else
-                                @indexes = new Indexes _.map result.indexes, (index) -> new Index index
-
-                            @table_view?.set_indexes @indexes
-                            delete result.indexes
-                        else
-                            @indexes = null
-
-                        if result.distribution?
-                            if @distribution?
-                                @distribution.set _.map result.distribution, (shard) -> new Shard shard
-                                @distribution.trigger 'update'
-                            else
-                                @distribution = new Distribution _.map(result.distribution, (shard) -> new Shard shard)
-                                if @table_view?
-                                    @table_view.set_distribution @distribution
-                        else
-                            @distribution = null
-                        delete result.distribution
-
-
-                        if result.shards_assignments?
-                            # Flatten all shards assignments because it's less work than handling nested collections
-                            shards_assignments = []
-                            for shard in result.shards_assignments
-                                shards_assignments.push
-                                    id: "start_shard_#{shard.id}"
-                                    shard_id: shard.id
-                                    num_keys: shard.num_keys
-                                    start_shard: true
-
-                                shards_assignments.push
-                                    id: "shard_primary_#{shard.id}"
-                                    primary: true
-                                    shard_id: shard.id
-                                    data: shard.primary
-
-                                for replica, position in shard.replicas
-                                    shards_assignments.push
-                                        id: "shard_replica_#{shard.id}_#{position}"
-                                        replica: true
-                                        replica_position: position
-                                        shard_id: shard.id
-                                        data: replica
-
-                                shards_assignments.push
-                                    id: "end_shard_#{shard.id}"
-                                    shard_id: shard.id
-                                    end_shard: true
-
-                            if @shards_assignments?
-                                @shards_assignments.set _.map shards_assignments, (shard) -> new ShardAssignment shard
-                            else
-                                @shards_assignments = new ShardAssignments _.map shards_assignments, (shard) -> new ShardAssignment shard
-                                if @table_view?
-                                    @table_view.set_assignments @shards_assignments
-
-                            delete result.shards_assignments
-
                         if @model?
                             @model.set result
                         else
@@ -211,7 +213,8 @@ module 'TableView', ->
                         type_all_url: 'tables'
             @
         remove: =>
-            driver.stop_timer @timer
+            driver.stop_timer @guaranteed_timer
+            driver.stop_timer @failable_timer
             @table_view?.remove()
             super()
 
@@ -397,7 +400,7 @@ module 'TableView', ->
         remove: =>
             if @reconfigure_modal?
                 @reconfigure_modal.remove()
-            if timer?
+            if @timer?
                 driver.stop_timer @timer
                 @timer = null
             @progress_bar.remove()
